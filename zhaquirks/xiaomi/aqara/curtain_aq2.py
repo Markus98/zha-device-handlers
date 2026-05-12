@@ -45,23 +45,39 @@ class AnalogOutputCurtainAq2(CustomCluster, AnalogOutput):
     def _handle_attribute_reported(self, event: AttributeReportedEvent) -> None:
         """Handle device attribute reports.
 
-        The device sends exactly two position reports per movement:
-          1. An echo of the current position ~30 ms after the write is acknowledged.
+        The device sends exactly two position reports per commanded movement:
+          1. An echo of the actual position ~30 ms after the write ACK (the motor
+             has already begun moving — e.g. starting at 100% open and commanding
+             0% will produce an echo around 97%).
           2. A final-position report when the curtain arrives at the target.
 
-        These are distinguished by WindowCovering's _is_moving flag:
+        After a stop or a physically-driven movement the device sends a single
+        natural position report ~1 s later with the actual stopped position.
 
-        - was_moving=True  → echo report: clear the flag and return.  The curtain is
-          still moving; reads of present_value are unreliable mid-movement, so we do
-          not update WindowCovering here.
+        Behaviour, distinguished by WindowCovering's _is_moving flag:
 
-        - was_moving=False → final (or periodic) report: accurate position data.
-          Update WindowCovering twice with the same value in the same event-loop turn.
-          ZHA's cover entity infers opening/closing direction from position jumps, so
-          the first call may briefly set _is_opening/_is_closing internally; the
-          second call at the same value immediately clears those flags before
-          async_write_ha_state() runs, preventing a spurious "is opening/closing"
-          state flash in Home Assistant.
+        - was_moving=True  → echo report: clear the flag and return without
+          updating WindowCovering.  The echo's position is accurate, but pushing
+          it through to ZHA would call _start_lift_transition(is_position_update=
+          True), which caps the cover entity's transition timer at ZHA's
+          DEFAULT_MOVEMENT_TIMEOUT (5 s).  Travel time for this device routinely
+          exceeds 5 s, so the timer would expire mid-movement and ZHA would
+          prematurely transition the entity to OPEN/CLOSED.  Discarding the echo
+          preserves the initial long timer (sized by distance to target), keeping
+          the cover in OPENING/CLOSING for the entire travel.
+
+        - was_moving=False → final, post-stop, or unsolicited report.  Drive
+          WindowCovering twice with the same value in the same event-loop turn.
+          When ZHA's _target_lift_position is None (post-stop or unsolicited),
+          _determine_state would otherwise infer a target from the previous→
+          current direction (e.g. 100 → 73 → infer target=CLOSED) and mark the
+          cover as CLOSING/OPENING despite the device having stopped — then
+          flip to OPEN/CLOSED 5 s later when the transition timer expires.
+          A second update at the same position leaves _lift_position_history
+          at [v, v] so the direction-inference branch is skipped (it requires
+          previous != current) and the state resolves immediately to OPEN/
+          CLOSED.  Harmless when a target is set (current == target already
+          resolves directly).
         """
         if event.attribute_id == self.AttributeDefs.present_value.id:
             wc = self.endpoint.window_covering
@@ -72,8 +88,6 @@ class AnalogOutputCurtainAq2(CustomCluster, AnalogOutput):
             wc_attr = WindowCovering.AttributeDefs.current_position_lift_percentage.id
             wc_pos = t.uint8_t(100 - event.value)
             wc.update_attribute(wc_attr, wc_pos)
-            # Second call with the same value: ZHA sees "position unchanged" and
-            # clears any opening/closing state it inferred from the first call.
             wc.update_attribute(wc_attr, wc_pos)
 
 
@@ -87,9 +101,15 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
     def __init__(self, *args, **kwargs):
         """Init."""
         super().__init__(*args, **kwargs)
-        # True between a movement command and the device's echo report.  Suppresses
-        # the post-command position poll while the position read is known to be
-        # unreliable (the motor is moving and reads return stale values).
+        # Tracks whether a commanded movement is in progress.  Set by command()
+        # when issuing up_open/down_close/go_to_lift_percentage and cleared
+        # either by the echo handler (AO._handle_attribute_reported) or by a
+        # successful stop.  Read in two places:
+        #  - AO._handle_attribute_reported uses it to distinguish the echo
+        #    report from the final/post-stop report.
+        #  - read_attributes uses it to suppress the post-command position
+        #    poll, which would otherwise trigger ZHA's transition-timer cap
+        #    (see read_attributes docstring).
         self._is_moving = False
 
     async def command(
@@ -107,16 +127,21 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
         target position to AnalogOutput present_value and set _is_moving=True.
 
         The device responds with two attribute reports per movement:
-          1. An echo of the current position (~30 ms after the write ACK).
+          1. An echo report (~30 ms after the write ACK) with the position the
+             motor has already reached.
           2. A final-position report when the curtain arrives.
-        The echo clears _is_moving; the final report drives the WC update (x2).
+        The echo clears _is_moving and is discarded; the final report drives
+        two synchronous WindowCovering updates.  See
+        AnalogOutputCurtainAq2._handle_attribute_reported for the rationale.
 
-        Reads of present_value are unreliable while the curtain is moving, so no
-        explicit position read is done after movement or stop commands.  The device's
-        own reports drive all position updates.
-
-        _is_moving suppresses the post-command position poll while the echo has not
-        yet arrived, preventing it from reading a stale position from the device.
+        No explicit position read is issued after a movement or stop command.
+        Pushing a position update mid-movement would trigger ZHA's
+        _start_lift_transition(is_position_update=True), capping the cover
+        entity's transition timer at DEFAULT_MOVEMENT_TIMEOUT (5 s) — shorter
+        than this device's travel time — which would prematurely transition
+        the entity to OPEN/CLOSED before the curtain arrives.  _is_moving
+        suppresses the post-command poll inside read_attributes for the same
+        reason.
         """
         if command_id == WindowCovering.ServerCommandDefs.up_open.id:
             self._is_moving = True
@@ -157,9 +182,8 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
             # Only clear once the stop has been acknowledged: if the send fails, the
             # curtain is still moving and position reads should remain suppressed.
             self._is_moving = False
-            # Do not read position here, reads are unreliable while the motor is
-            # decelerating.  The device sends a natural position report ~1 second
-            # after stopping with the actual stopped position, which is accurate.
+            # The device sends a natural position report ~1 s after stopping; that
+            # report drives the WindowCovering update via _handle_attribute_reported.
             return result
 
         return foundation.GENERAL_COMMANDS[
@@ -173,10 +197,13 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
     ) -> Any:
         """Redirect current_position_lift_percentage reads to AnalogOutput present_value.
 
-        While _is_moving is True the redirect is suppressed so that the post-command
-        poll cannot read a stale position from the device before the echo report
-        clears the flag.  The cached position (last known good value) is returned
-        instead so the caller always gets a defined response for the attribute.
+        While _is_moving is True the redirect is suppressed.  Letting a read
+        complete mid-movement would push a position update through to ZHA,
+        triggering _start_lift_transition(is_position_update=True) and capping
+        the cover entity's transition timer at DEFAULT_MOVEMENT_TIMEOUT (5 s) —
+        shorter than this device's travel time, causing a premature OPEN/CLOSED
+        transition.  The last cached position is returned instead so the caller
+        always gets a defined response for the attribute.
         """
         success = {}
         failure = {}
@@ -200,10 +227,11 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
                 if pv in ao_failure:
                     failure[pos_attr_key] = ao_failure[pv]
             else:
-                # Return the last cached position rather than reading the device,
-                # whose response would be unreliable mid-movement.  If nothing is
-                # cached yet, surface a defined failure rather than silently
-                # dropping the attribute from the response.
+                # Return the last cached position rather than reading the device.
+                # A live read would propagate a position update to ZHA mid-
+                # movement, capping its transition timer at 5 s (see docstring).
+                # If nothing is cached yet, surface a defined failure rather
+                # than silently dropping the attribute from the response.
                 cached = self._attr_cache.get(pos_attr_def.id)
                 if cached is not None:
                     success[pos_attr_key] = cached

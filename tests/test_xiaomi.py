@@ -2791,16 +2791,15 @@ async def test_aqara_aq2_roller_position_updates(zigpy_device_from_v2_quirk):
     assert window_covering_cluster._is_moving is False
 
 
-async def test_aqara_aq2_roller_reconfirm_position_after_stop(
+async def test_aqara_aq2_roller_final_position_report(
     zigpy_device_from_v2_quirk,
 ):
-    """Test that a final-position report triggers two synchronous WC updates.
+    """Test that a final/post-stop position report drives two identical WC updates.
 
-    ZHA's cover entity infers opening/closing direction from position jumps.  To
-    prevent a spurious "is opening/closing" flash, the quirk calls update_attribute
-    twice with the same value in the same event-loop turn: the first call may set
-    an internal opening/closing flag, but the second call (same position → no change)
-    clears it before async_write_ha_state() has a chance to run.
+    With _is_moving=False the quirk emits two update_attribute calls at the same
+    value so ZHA's _lift_position_history ends at [v, v].  This skips the
+    "infer target from direction" branch in _determine_state, which would
+    otherwise mark the cover as CLOSING/OPENING after a post-stop report.
     """
     device = zigpy_device_from_v2_quirk(LUMI, "lumi.curtain.aq2")
 
@@ -2838,17 +2837,12 @@ async def test_aqara_aq2_roller_reconfirm_position_after_stop(
         )
     )
 
-    # Two synchronous updates at the same value — no async task needed
-    assert window_covering_cluster._is_moving is False
-    assert len(window_covering_listener.attribute_updates) == 2
-    assert window_covering_listener.attribute_updates[0] == (
+    expected = (
         WindowCovering.AttributeDefs.current_position_lift_percentage.id,
         40,  # 100 - 60
     )
-    assert window_covering_listener.attribute_updates[1] == (
-        WindowCovering.AttributeDefs.current_position_lift_percentage.id,
-        40,  # same value — ZHA sees no movement and clears opening/closing state
-    )
+    assert window_covering_cluster._is_moving is False
+    assert window_covering_listener.attribute_updates == [expected, expected]
 
 
 async def test_aqara_aq2_roller_read_suppressed_during_movement(
