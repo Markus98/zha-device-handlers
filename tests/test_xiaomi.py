@@ -2540,7 +2540,7 @@ async def test_aqara_aq2_roller_commands(
         )
 
         # confirm _is_moving is set so ZHA's post-command poll is suppressed
-        assert analog_cluster._is_moving is True
+        assert window_covering_cluster._is_moving is True
 
         # confirm no immediate position read after movement commands
         assert len(window_covering_cluster._read_attributes.mock_calls) == 0
@@ -2564,7 +2564,6 @@ async def test_aqara_aq2_roller_command_stop(zigpy_device_from_v2_quirk):
     device = zigpy_device_from_v2_quirk(LUMI, "lumi.curtain.aq2")
 
     window_covering_cluster = device.endpoints[1].window_covering
-    analog_cluster = device.endpoints[1].analog_output
 
     patch_window_covering_request = mock.patch.object(
         window_covering_cluster,
@@ -2581,12 +2580,12 @@ async def test_aqara_aq2_roller_command_stop(zigpy_device_from_v2_quirk):
 
     with patch_window_covering_request:
         # simulate a curtain that is currently moving
-        analog_cluster._is_moving = True
+        window_covering_cluster._is_moving = True
 
         await window_covering_cluster.stop()
 
         # confirm _is_moving is cleared so position reads are no longer suppressed
-        assert analog_cluster._is_moving is False
+        assert window_covering_cluster._is_moving is False
 
         # confirm the standard ZCL stop command was sent
         assert window_covering_cluster.request.call_count == 1
@@ -2758,7 +2757,7 @@ async def test_aqara_aq2_roller_position_updates(zigpy_device_from_v2_quirk):
     # WindowCovering update at all.  The device has not moved yet; reads during
     # movement are unreliable.  The final-position report (was_moving=False) drives
     # the update; that path is covered by test_aqara_aq2_roller_reconfirm_*.
-    analog_cluster._is_moving = True
+    window_covering_cluster._is_moving = True
 
     aq2_attr = foundation.Attribute(
         attrid=analog_attr.id,
@@ -2789,7 +2788,7 @@ async def test_aqara_aq2_roller_position_updates(zigpy_device_from_v2_quirk):
     # No immediate position update — deferred to reconfirm
     assert len(window_covering_listener.attribute_updates) == 0
     # confirm the report cleared the moving flag
-    assert analog_cluster._is_moving is False
+    assert window_covering_cluster._is_moving is False
 
 
 async def test_aqara_aq2_roller_reconfirm_position_after_stop(
@@ -2810,7 +2809,7 @@ async def test_aqara_aq2_roller_reconfirm_position_after_stop(
     window_covering_listener = ClusterListener(window_covering_cluster)
 
     # _is_moving is False: this is the final-position report (curtain arrived)
-    analog_cluster._is_moving = False
+    window_covering_cluster._is_moving = False
 
     # Simulate the device's final-position report: present_value=60 (40% open)
     report_attr = foundation.Attribute(
@@ -2840,7 +2839,7 @@ async def test_aqara_aq2_roller_reconfirm_position_after_stop(
     )
 
     # Two synchronous updates at the same value — no async task needed
-    assert analog_cluster._is_moving is False
+    assert window_covering_cluster._is_moving is False
     assert len(window_covering_listener.attribute_updates) == 2
     assert window_covering_listener.attribute_updates[0] == (
         WindowCovering.AttributeDefs.current_position_lift_percentage.id,
@@ -2855,8 +2854,15 @@ async def test_aqara_aq2_roller_reconfirm_position_after_stop(
 async def test_aqara_aq2_roller_read_suppressed_during_movement(
     zigpy_device_from_v2_quirk,
 ):
-    """Test that position reads via WindowCovering are suppressed while moving."""
+    """Test position reads via WindowCovering are suppressed while moving.
+
+    The redirect to AnalogOutput is suppressed because reads during motor movement
+    return unreliable values.  Callers still receive a defined response: the cached
+    position when available, otherwise FAILURE — never a silently dropped attribute.
+    """
     device = zigpy_device_from_v2_quirk(LUMI, "lumi.curtain.aq2")
+
+    pos_attr = WindowCovering.AttributeDefs.current_position_lift_percentage
 
     window_covering_cluster = device.endpoints[1].window_covering
     window_covering_listener = ClusterListener(window_covering_cluster)
@@ -2878,28 +2884,36 @@ async def test_aqara_aq2_roller_read_suppressed_during_movement(
     )
 
     with patch_analog_read:
-        # simulate curtain in motion
-        analog_cluster._is_moving = True
+        # simulate curtain in motion with no cached position yet
+        window_covering_cluster._is_moving = True
 
-        await window_covering_cluster.read_attributes(
-            [WindowCovering.AttributeDefs.current_position_lift_percentage.id]
-        )
+        success, failure = await window_covering_cluster.read_attributes([pos_attr.id])
 
-        # redirect suppressed — device was not read and position was not updated
+        # redirect suppressed — device was not read and no listener update fired
         assert len(analog_cluster._read_attributes.mock_calls) == 0
         assert len(window_covering_listener.attribute_updates) == 0
+        # no cache → defined FAILURE response, not a silent drop
+        assert pos_attr.id in failure
+        assert pos_attr.id not in success
+
+        # populate the cache with a known position (e.g. from an earlier report)
+        window_covering_cluster._attr_cache[pos_attr.id] = 42
+
+        success, failure = await window_covering_cluster.read_attributes([pos_attr.id])
+
+        # still no device read; the cached value is returned via success
+        assert len(analog_cluster._read_attributes.mock_calls) == 0
+        assert success == {pos_attr.id: 42}
+        assert pos_attr.id not in failure
 
         # once movement stops, the redirect works normally again
-        analog_cluster._is_moving = False
+        window_covering_cluster._is_moving = False
 
-        await window_covering_cluster.read_attributes(
-            [WindowCovering.AttributeDefs.current_position_lift_percentage.id]
-        )
+        await window_covering_cluster.read_attributes([pos_attr.id])
 
         assert len(analog_cluster._read_attributes.mock_calls) == 1
-        assert len(window_covering_listener.attribute_updates) == 1
-        assert window_covering_listener.attribute_updates[0] == (
-            WindowCovering.AttributeDefs.current_position_lift_percentage.id,
+        assert window_covering_listener.attribute_updates[-1] == (
+            pos_attr.id,
             50,  # 100 - 50
         )
 

@@ -29,7 +29,6 @@ class AnalogOutputCurtainAq2(CustomCluster, AnalogOutput):
     def __init__(self, *args, **kwargs):
         """Init."""
         super().__init__(*args, **kwargs)
-        self._is_moving = False
         self.on_event(AttributeReadEvent.event_type, self._handle_attribute_read)
         self.on_event(
             AttributeReportedEvent.event_type, self._handle_attribute_reported
@@ -50,7 +49,7 @@ class AnalogOutputCurtainAq2(CustomCluster, AnalogOutput):
           1. An echo of the current position ~30 ms after the write is acknowledged.
           2. A final-position report when the curtain arrives at the target.
 
-        These are distinguished by the _is_moving flag:
+        These are distinguished by WindowCovering's _is_moving flag:
 
         - was_moving=True  → echo report: clear the flag and return.  The curtain is
           still moving; reads of present_value are unreliable mid-movement, so we do
@@ -65,16 +64,17 @@ class AnalogOutputCurtainAq2(CustomCluster, AnalogOutput):
           state flash in Home Assistant.
         """
         if event.attribute_id == self.AttributeDefs.present_value.id:
-            was_moving = self._is_moving
-            self._is_moving = False
+            wc = self.endpoint.window_covering
+            was_moving = wc._is_moving
+            wc._is_moving = False
             if was_moving:
                 return
             wc_attr = WindowCovering.AttributeDefs.current_position_lift_percentage.id
             wc_pos = t.uint8_t(100 - event.value)
-            self.endpoint.window_covering.update_attribute(wc_attr, wc_pos)
+            wc.update_attribute(wc_attr, wc_pos)
             # Second call with the same value: ZHA sees "position unchanged" and
             # clears any opening/closing state it inferred from the first call.
-            self.endpoint.window_covering.update_attribute(wc_attr, wc_pos)
+            wc.update_attribute(wc_attr, wc_pos)
 
 
 class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
@@ -83,6 +83,14 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
     _CONSTANT_ATTRIBUTES = {
         WindowCovering.AttributeDefs.window_covering_type.id: WindowCovering.WindowCoveringType.Rollershade,
     }
+
+    def __init__(self, *args, **kwargs):
+        """Init."""
+        super().__init__(*args, **kwargs)
+        # True between a movement command and the device's echo report.  Suppresses
+        # the post-command position poll while the position read is known to be
+        # unreliable (the motor is moving and reads return stale values).
+        self._is_moving = False
 
     async def command(
         self,
@@ -111,7 +119,7 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
         yet arrived, preventing it from reading a stale position from the device.
         """
         if command_id == WindowCovering.ServerCommandDefs.up_open.id:
-            self.endpoint.analog_output._is_moving = True
+            self._is_moving = True
             (res,) = await self.endpoint.analog_output.write_attributes(
                 {AnalogOutput.AttributeDefs.present_value.name: 100.0}
             )
@@ -120,7 +128,7 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
             ].schema(command_id=command_id, status=res[0].status)
 
         if command_id == WindowCovering.ServerCommandDefs.down_close.id:
-            self.endpoint.analog_output._is_moving = True
+            self._is_moving = True
             (res,) = await self.endpoint.analog_output.write_attributes(
                 {AnalogOutput.AttributeDefs.present_value.name: 0.0}
             )
@@ -129,7 +137,7 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
             ].schema(command_id=command_id, status=res[0].status)
 
         if command_id == WindowCovering.ServerCommandDefs.go_to_lift_percentage.id:
-            self.endpoint.analog_output._is_moving = True
+            self._is_moving = True
             (res,) = await self.endpoint.analog_output.write_attributes(
                 {AnalogOutput.AttributeDefs.present_value.name: float(100 - args[0])}
             )
@@ -138,7 +146,6 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
             ].schema(command_id=command_id, status=res[0].status)
 
         if command_id == WindowCovering.ServerCommandDefs.stop.id:
-            self.endpoint.analog_output._is_moving = False
             result = await super().command(
                 command_id,
                 *args,
@@ -147,6 +154,9 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
                 tsn=tsn,
                 **kwargs,
             )
+            # Only clear once the stop has been acknowledged: if the send fails, the
+            # curtain is still moving and position reads should remain suppressed.
+            self._is_moving = False
             # Do not read position here, reads are unreliable while the motor is
             # decelerating.  The device sends a natural position report ~1 second
             # after stopping with the actual stopped position, which is accurate.
@@ -165,7 +175,8 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
 
         While _is_moving is True the redirect is suppressed so that the post-command
         poll cannot read a stale position from the device before the echo report
-        clears the flag.
+        clears the flag.  The cached position (last known good value) is returned
+        instead so the caller always gets a defined response for the attribute.
         """
         success = {}
         failure = {}
@@ -178,7 +189,7 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
 
         if pos_attr_key is not None:
             remaining = [a for a in attributes if a != pos_attr_key]
-            if not self.endpoint.analog_output._is_moving:
+            if not self._is_moving:
                 pv = AnalogOutput.AttributeDefs.present_value
                 (
                     ao_success,
@@ -188,6 +199,16 @@ class WindowCoveringCurtainAq2(CustomCluster, WindowCovering):
                     success[pos_attr_key] = t.uint8_t(100 - ao_success[pv])
                 if pv in ao_failure:
                     failure[pos_attr_key] = ao_failure[pv]
+            else:
+                # Return the last cached position rather than reading the device,
+                # whose response would be unreliable mid-movement.  If nothing is
+                # cached yet, surface a defined failure rather than silently
+                # dropping the attribute from the response.
+                cached = self._attr_cache.get(pos_attr_def.id)
+                if cached is not None:
+                    success[pos_attr_key] = cached
+                else:
+                    failure[pos_attr_key] = foundation.Status.FAILURE
         else:
             remaining = attributes
 
